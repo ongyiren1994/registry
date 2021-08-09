@@ -36,6 +36,101 @@ import Text.Parsing.StringParser as Parser
 import Web.Bower.PackageMeta (Dependencies(..))
 import Web.Bower.PackageMeta as Bower
 
+
+{- TODO:
+Go through all packages in the registry at all versions and attempt to produce
+a manifest for that package. For now we are only attempting to convert
+Bowerfiles, but some packages in the registry have a valid spago.dhall file but
+not a valid Bowerfile, and some packages have no valid manifest at all.
+
+The result of importing all packages from the registry should be two data
+structures:
+
+1. A map of package names to manifests for all packages at versions that
+   produce a valid manifest. This structure will be used to push manifests
+   into the registry index and to create tarballs for the registry itself.
+2. A map of import errors to package information for all packages at versions
+   that do not produce a valid manifest. This structure will be used to fix
+   as many packages and versions as we can, and otherwise to list all the
+   packages and versions that are not being included in the official registry
+   along with why and how they could be fixed.
+
+TODO:
+
+- [x] Create a data structure for successfully-produced manifests
+- [x] Create a data structure for packages and versions that do not have a
+      valid manifest as output
+- [ ] Create a helper function that attempts to produce a manifest for a
+      package and version and produces either a success or failure result. Pull
+      the relevant functionality out of `main`
+- [ ] Create a helper function that can produce all successful manifests and
+      failed manifests and creates the data structures in steps 1 & 2.
+- [ ] Create a function to write out all failed packages & versions into a
+      diagnostics file that we can use to go through and fix broken packages.
+- [ ] Rewrite `main` to use these helper functions so that successful manifests
+      are stored on disk and failed manifests produce a diagnostics file.
+1. Return a Map PackageName (NonEmptyArray Manifest) for all successful packages
+2. Return a Map ImportError (NonEmptyArray FailedImport) for packages that fail so that we
+  can diagnose what is wrong and whether we can fix it.
+-}
+
+-- | A data structure representing package names that have successfully been
+-- | imported from the old registries and can be added to the new registry.
+type PackageManifests = Map PackageName (NonEmptyArray Manifest)
+
+-- | A data structure representing packages and versions that do not produce a
+-- | valid manifest, along with information about why they fail to import.
+type FailedImports = Map ImportError (NonEmptyArray FailedImport)
+
+-- | A package version that cannot be used to produce a manifest
+type FailedImport =
+  { name :: PackageName
+  , version :: String
+  }
+
+-- | An error representing why a package version cannot be imported from the
+-- | Bower registry.
+data ImportError
+  -- TODO: This isn't strictly an error, because not all valid packages need one
+  -- (ie. they use spago.dhall only); perhaps we should check for a bowerfile,
+  -- and if there isn't one then use the spago.dhall file, and if neither work
+  -- only then throw an error.
+  = MissingBowerfile
+  -- This means we can't decode the JSON for a Bowerfile. The string contains the
+  -- contents of the file.
+  | MalformedBowerJson String
+  -- This means the package declares dependencies that are themselves not listed
+  -- in the combined Bower + new-packages registries. The registry only accepts
+  -- packages that depend on packages from the registry. The array contains the
+  -- list of dependencies that are not in the registry.
+  | NonRegistryDependencies (NonEmptyArray PackageName)
+  -- This means that the Bowerfile is not valid for the purposes of converting
+  -- it into a manifest.
+  | ManifestError ManifestError
+
+printImportError :: ImportError -> String
+printImportError _ = "TODO"
+
+-- | An error representing why a Bowerfile cannot be migrated into a manifest.
+data ManifestError
+  -- The Bowerfile does not include a package name
+  = MissingName
+  -- The Bowerfile does not include a license
+  | MissingLicense
+  -- The package name contains a license, but it is not a valid SPDX license
+  | BadLicense String
+  -- The Bowerfile declares a version that is not a valid SemVer version. The
+  -- String is the failed version.
+  -- TODO: What do we do when the Bowerfile version and the tagged version do
+  -- not match? It's somewhat common to forget to update the Bowerfile version.
+  | BadVersion String
+  -- The Bowerfile declares one or more dependencies that have invalid SemVer
+  -- version bounds.
+  | BadDependencyVersions (NonEmptyArray { dependency :: PackageName, failedBounds :: String })
+
+printManifestError :: ManifestError -> String
+printManifestError _ = "TODO"
+
 type PackageName = String
 
 type ReleasesIndex = Map PackageName PackageReleases
