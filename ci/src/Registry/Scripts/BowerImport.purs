@@ -30,11 +30,8 @@ import Registry.Scripts.BowerImport.Error as BowerImport.Error
 import Text.Parsing.StringParser as StringParser
 import Web.Bower.PackageMeta as Bower
 
-exclusionsFile :: FilePath
-exclusionsFile = "./bower-exclusions.json"
-
-errorsFile :: FilePath
-errorsFile = "./bower-failures.json"
+failuresFile :: FilePath
+failuresFile = "./bower-failures.json"
 
 manifestsFile :: FilePath
 manifestsFile = "./bower-manifests.json"
@@ -72,23 +69,20 @@ downloadLegacyRegistry = do
   -- and new-packages files.
   log "Reading legacy registry packages..."
   allPackages <- readRegistryPackages
-  exclusions <- readExclusionsFile
 
   -- Then we transform each package into a manifest, fixing as many packages as
   -- we can, and collecting errors along the way.
   log "Transforming legacy packages to manifests..."
   { failures, packages } <-
     runPackageTransform getReleases { failures: Map.empty, packages: allPackages }
-      >>= runPackageVersionTransform (skipExcluded exclusions)
       >>= runPackageVersionTransform fetchBowerfile
       >>= runPackageVersionTransform (checkSelfContained allPackages)
       >>= runPackageVersionTransform convertToManifest
 
   -- Then, we write failed packages out to files so we can fix the errors or
   -- simply list packages that won't be included in the new registry.
-  log "Writing exclusions and errors files..."
+  log $ "Writing packages that failed to import to " <> failuresFile
   writeFailuresFile failures
-  writeExclusionsFile failures
 
   let
     manifests = do
@@ -101,50 +95,48 @@ downloadLegacyRegistry = do
 -- | Find all released tags for the package, returning the parsed repository
 -- | location and a map of tags.
 getReleases :: PackageTransform RawPackageName { meta :: GitHub.Address, versions :: Map GitHub.Tag Unit }
-getReleases = PackageTransform "Get released GitHub tags" \name repo -> do
-  address <- case GitHub.parseRepo repo of
-    Left err -> throwError $ InvalidGitHubRepo $ StringParser.printParserError err
-    Right address -> pure address
+getReleases = do
+  let label = "Get released GitHub tags"
+  PackageTransform label \name repo -> do
+    address <- case GitHub.parseRepo repo of
+      Left err -> throwError $ InvalidGitHubRepo $ StringParser.printParserError err
+      Right address -> pure address
 
-  let repoCache = Array.fold [ "releases__", address.owner, "__", address.repo ]
+    let repoCache = Array.fold [ "releases__", address.owner, "__", address.repo ]
 
-  releases <- withCache repoCache (Just $ Hours 24.0) do
-    log $ "Fetching releases for package " <> name
-    lift $ GitHub.getReleases address
+    releases <- withCache repoCache (Just $ Hours 24.0) do
+      log $ "Fetching releases for package " <> name
+      lift $ GitHub.getReleases address
 
-  versions <- case releases of
-    [] -> throwError NoReleases
-    _ -> pure $ Map.fromFoldable $ map (\tag -> Tuple tag unit) releases
+    versions <- case NEA.fromArray releases of
+      Nothing -> throwError NoReleases
+      Just arr -> pure $ Map.fromFoldable $ map (\tag -> Tuple tag unit) arr
 
-  pure { meta: address, versions }
-
--- | Find the bower.json files associated with the package's relaesed tags.
-skipExcluded :: Map String (Array (Maybe String)) -> PackageVersionTransform GitHub.Address Unit Unit
-skipExcluded exclusions = PackageVersionTransform "Filter out excluded packages" \package _ tag _ -> do
-  for_ (Map.lookup package exclusions) \tags ->
-    when (Array.elem Nothing tags || Array.elem (Just tag.name) tags) do
-      throwError ExcludedPackage
+    pure { meta: address, versions }
 
 -- | Find the bower.json files associated with the package's released tags,
 -- | caching the file to avoid re-fetching each time the tool runs.
 fetchBowerfile :: PackageVersionTransform GitHub.Address Unit Bower.PackageMeta
-fetchBowerfile = PackageVersionTransform "Fetch bower.json for tag" \package address tag _ -> do
-  let
-    url = "https://raw.githubusercontent.com/" <> address.owner <> "/" <> address.repo <> "/" <> tag.name <> "/bower.json"
-    bowerfileCache = "bowerfile__" <> package <> "__" <> tag.name
+fetchBowerfile = do
+  let label = "Fetch bower.json file for for the package version"
+  PackageVersionTransform label \package address tag _ -> do
+    let
+      url = "https://raw.githubusercontent.com/" <> address.owner <> "/" <> address.repo <> "/" <> tag.name <> "/bower.json"
+      bowerfileCache = "bowerfile__" <> package <> "__" <> tag.name
 
-  withCache bowerfileCache Nothing do
-    lift (Http.get ResponseFormat.string url) >>= case _ of
-      Left _ -> throwError MissingBowerfile
-      Right { body } -> case Json.parseJson body >>= Json.decodeJson of
-        Left err -> throwError $ MalformedBowerJson err
-        Right res -> pure res
+    withCache bowerfileCache Nothing do
+      lift (Http.get ResponseFormat.string url) >>= case _ of
+        Left _ -> throwError MissingBowerfile
+        Right { body } -> case Json.parseJson body >>= Json.decodeJson of
+          Left err -> throwError $ MalformedBowerJson err
+          Right res -> pure res
 
 -- | Verify that the dependencies listed in the bower.json files are all
 -- | contained within the registry.
 checkSelfContained :: Map RawPackageName String -> PackageVersionTransform GitHub.Address Bower.PackageMeta Bower.PackageMeta
-checkSelfContained registry =
-  PackageVersionTransform "Check dependencies are all in the registry" \_ _ _ (Bower.PackageMeta bowerfile) -> do
+checkSelfContained registry = do
+  let label = "Check dependencies are all in the registry"
+  PackageVersionTransform label \_ _ _ (Bower.PackageMeta bowerfile) -> do
     let
       -- Packages can be specified either in 'package-name' format or
       -- in owner/package-name format. This function ensures we don't pick
@@ -172,12 +164,14 @@ checkSelfContained registry =
         throwError $ NonRegistryDependencies outside
 
 convertToManifest :: PackageVersionTransform GitHub.Address Bower.PackageMeta Manifest
-convertToManifest = PackageVersionTransform "Convert Bowerfile to a manifest" \package address tag bowerfile -> do
-  let
-    repo = GitHub { owner: address.owner, repo: address.repo, subdir: Nothing }
-    liftError = map (lmap ManifestError)
+convertToManifest = do
+  let label = "Convert Bowerfile to a Manifest"
+  PackageVersionTransform label \package address tag bowerfile -> do
+    let
+      repo = GitHub { owner: address.owner, repo: address.repo, subdir: Nothing }
+      liftError = map (lmap ManifestError)
 
-  Except.mapExceptT liftError $ toManifest package repo tag.name bowerfile
+    Except.mapExceptT liftError $ toManifest package repo tag.name bowerfile
 
 -- | Convert a package from Bower to a Manifest.
 -- This function is written a bit awkwardly because we want to collect validation
@@ -309,9 +303,7 @@ toManifest package repository ref (Bower.PackageMeta bowerfile) = do
 -- | package. If a package cannot be transformed, throw an `ImportError`
 -- | exception via `ExceptT` and the error will be collected.
 data PackageTransform a b =
-  PackageTransform
-    String
-    (RawPackageName -> a -> ExceptT ImportError Aff b)
+  PackageTransform String (RawPackageName -> a -> ExceptT ImportError Aff b)
 
 -- | Execute the provided transform on every package in the input packages map,
 -- | collecting failures into the `PackageFailures` and preserving successfully-
@@ -344,9 +336,7 @@ type PackageMap meta a = Map RawPackageName { meta :: meta, versions :: Map GitH
 -- | transformed, throw an `ImportError` exception via `ExceptT` and the error
 -- | will be collected.
 data PackageVersionTransform meta a b =
-  PackageVersionTransform
-    String
-    (RawPackageName -> meta -> GitHub.Tag -> a -> ExceptT ImportError Aff b)
+  PackageVersionTransform String (RawPackageName -> meta -> GitHub.Tag -> a -> ExceptT ImportError Aff b)
 
 -- | Execute the provided transform on every package in the input packages map, at
 -- | every version of that package, collecting failures into `PackageFailures`
@@ -388,14 +378,19 @@ withCache
   -> ExceptT ImportError Aff a
   -> ExceptT ImportError Aff a
 withCache path maybeDuration action = do
-  let cacheFolder = ".cache"
-  let objectPath = cacheFolder <> "/" <> path
-  let dump = Json.encodeJson >>> Json.stringifyWithIndent 2
-  let fromJson = Json.jsonParser >=> (Json.decodeJson >>> lmap Json.printJsonDecodeError)
-  let yolo a = unsafePartial $ fromJust a
-
   let
-    cacheHit = liftAff do
+    cacheFolder = ".cache"
+    objectPath = cacheFolder <> "/" <> path
+    fromJson = Json.jsonParser >=> (Json.decodeJson >>> lmap Json.printJsonDecodeError)
+    yolo a = unsafePartial $ fromJust a
+
+    onCacheMiss = do
+      log $ "No cache hit for " <> show path
+      result <- action
+      lift $ writeJsonFile objectPath result
+      pure result
+
+    isCacheHit = liftAff do
       exists <- FS.exists objectPath
       expired <- case exists, maybeDuration of
         _, Nothing -> pure false
@@ -407,76 +402,33 @@ withCache path maybeDuration action = do
           let expiryTime = yolo $ Time.adjust duration lastModified
           pure (now > expiryTime)
       pure (exists && not expired)
+
   lift $ unlessM (FS.exists cacheFolder) (FS.mkdir cacheFolder)
 
-  let
-    onMiss = do
-      log $ "No cache hit for " <> show path
-      result <- action
-      lift $ FS.writeTextFile UTF8 objectPath (dump result)
-      pure result
-
-  cacheHit >>= case _ of
+  isCacheHit >>= case _ of
     true -> do
       strResult <- lift $ FS.readTextFile UTF8 objectPath
-      case (fromJson strResult) of
+      case fromJson strResult of
         Right res -> pure res
         Left err -> do
           log $ "Unable to read cache file " <> err
-          onMiss
+          onCacheMiss
     false -> do
-      onMiss
-
--- The exclusions file pairs package name keys with an array of versions that
--- should be excluded.
-readExclusionsFile :: Aff (Map String (Array (Maybe String)))
-readExclusionsFile = do
-  str <- FS.readTextFile UTF8 exclusionsFile
-  case Json.parseJson str >>= Json.decodeJson of
-    Left e ->
-      throwError $ Aff.error $ Json.printJsonDecodeError e
-    Right (v :: Object (Array (Maybe String))) ->
-      pure $ Map.fromFoldable (Object.toUnfoldable v :: Array _)
-
--- | Write packages that failed because they do not have a Bowerfile out to an
--- | exclusions file so that we don't attempt to fetch their Bowerfile each time
--- | the tool runs.
-writeExclusionsFile :: PackageFailures -> Aff Unit
-writeExclusionsFile failures =
-  for_ (toExclusionsObject failures) (writeJsonFile exclusionsFile)
-
--- | Segment out packages that should be excluded from future runs of the Bower
--- | import tool. Packages should be excluded if we cannot get a valid Bowerfile.
-toExclusionsObject :: PackageFailures -> Maybe (Object (Array (Maybe String)))
-toExclusionsObject =
-  (\obj -> if Object.isEmpty obj then Nothing else Just obj)
-    <<< map (map (map _.name))
-    <<< Object.fromFoldable
-    <<< map (lmap stripPureScriptPrefix)
-    <<< (Map.toUnfoldable :: _ -> Array (Tuple String (Array (Maybe GitHub.Tag))))
-    <<< map (map fst <<< Map.toUnfoldable)
-    <<< filterErrors
-  where
-  -- If we reach the point where we attempt to get a Bowerfile, but we can't
-  -- get one for a package, then one of these errors will be thrown. We can use
-  -- them to skip fetching unavailable files.
-  condition = case _ of
-    MissingBowerfile -> true
-    MalformedBowerJson _ -> true
-    _ -> false
-
-  filterErrors = Map.mapMaybe \a -> case Map.filter condition a of
-    newMap
-      | Map.isEmpty newMap -> Nothing
-      | otherwise -> Just newMap
+      onCacheMiss
 
 -- | Write package failures out to a diagnostics file
 writeFailuresFile :: PackageFailures -> Aff Unit
-writeFailuresFile = writeJsonFile errorsFile <<< toFailureObject
+writeFailuresFile = writeJsonFile failuresFile <<< toFailureObject
 
+-- | Transform package failures into an object keyed by, in order:
+-- |   - the type of error that occurred
+-- |   - the name of the package
+-- |   - the version of the package
+-- |
+-- | where the value paired with each version is a full description of the error
+-- | that caused the particular package version to fail.
 toFailureObject
   :: PackageFailures
-  -- Map ErrorName (Map PackageName (Map (Maybe Tag) (Maybe (Array DetailedError))))
   -> Object (Object (Object String))
 toFailureObject m = do
   foldlWithIndex foldFn Object.empty m
