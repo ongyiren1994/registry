@@ -174,16 +174,13 @@ addOrUpdate { ref, fromBower, packageName } metadata = do
         throwWithComment $ "Error while reading Bowerfile: " <> err
       Right bowerfile -> do
         let
-          name =
-            PackageName.print packageName
-
           printErrors =
             String.joinWith ", " <<< map BowerImport.printManifestError <<< NEA.toArray
 
           runManifest =
             Except.runExceptT <<< Except.mapExceptT (liftAff <<< map (lmap printErrors))
 
-        runManifest (BowerImport.toManifest name metadata.location ref bowerfile) >>= case _ of
+        runManifest (BowerImport.toManifest packageName metadata.location ref bowerfile) >>= case _ of
           Left err ->
             throwWithComment $ "Unable to convert Bowerfile to a manifest: " <> err
           Right manifest ->

@@ -67,7 +67,7 @@ printImportError = case _ of
 -- | An error representing why a Bowerfile cannot be migrated into a manifest.
 data ManifestError
   = MissingName
-  | MismatchedName { expected :: String, received :: String }
+  | MismatchedName { expected :: PackageName, received :: String }
   | MissingLicense
   | BadLicense (Array String)
   | BadVersion String
@@ -91,7 +91,7 @@ printManifestError = case _ of
 
   MismatchedName { expected, received } ->
     "Bower file should have name purescript-"
-      <> expected
+      <> PackageName.print expected
       <> " but has name "
       <> received
 
