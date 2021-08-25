@@ -30,7 +30,6 @@ import Registry.PackageName (PackageName)
 import Registry.PackageName as PackageName
 import Registry.Schema (Repo(..), Manifest)
 import Registry.Scripts.BowerImport.Error (ImportError(..), ManifestError(..))
-import Registry.Scripts.BowerImport.Error as BowerImport.Error
 import Text.Parsing.StringParser as StringParser
 import Web.Bower.PackageMeta as Bower
 
@@ -53,7 +52,7 @@ type PackageFailures = Map RawPackageName (Map (Maybe String) ImportError)
 main :: Effect Unit
 main = Aff.launchAff_ do
   log "Starting import from legacy registries..."
-  registry <- downloadBowerRegistry
+  _registry <- downloadBowerRegistry
   log "Done!"
 
 downloadBowerRegistry :: Aff RegistryIndex
@@ -112,11 +111,14 @@ downloadBowerRegistry = do
     Except.mapExceptT liftError $ toManifest name repo semVer bowerfile
 
   let
-    exclusions :: Object String
-    exclusions = ?c manifestRegistry.failures
+    exclusions :: Object _
+    exclusions = mkExclusions manifestRegistry.failures
+
+    packageMap :: Map PackageName (Map SemVer Manifest)
+    packageMap = Map.fromFoldable $ map (lmap _.name) $ (Map.toUnfoldable manifestRegistry.packages :: Array _)
 
     registryIndex :: RegistryIndex
-    registryIndex = ?b manifestRegistry.packages
+    registryIndex = mkRegistryIndex packageMap
 
   writeJsonFile "bower-exclusions.json" exclusions
   pure registryIndex
@@ -269,7 +271,7 @@ toManifest package repository version (Bower.PackageMeta bowerfile) = do
 -- | the object expired if its lifetime is past the duration.
 -- | Otherwise, this will behave like a write-only cache.
 withCache
-  :: forall m a
+  :: forall a
    . Json.DecodeJson a
   => Json.EncodeJson a
   => FilePath
@@ -372,7 +374,7 @@ type ProcessedPackageVersions k1 k2 a = ProcessedPackages k1 (Map k2 a)
 -- | at every version of that package, collecting failures into `PackageFailures`
 -- | and preserving transformed packages.
 forPackageVersion
-  :: forall k1 k2 k3 a b
+  :: forall k1 k2 a b
    . Ord k1
   => Ord k2
   => ProcessedPackageVersions k1 k2 a
@@ -431,7 +433,6 @@ forPackageVersionKeys input keyToPackageName keyToTag f = do
               insertPackage = Map.insertWith Map.union k3 newPackage
             State.modify \state -> state { packages = insertPackage state.packages }
 
-{-
 -- | Transform package failures into an object keyed by, in order:
 -- |   - the type of error that occurred
 -- |   - the name of the package
@@ -439,29 +440,8 @@ forPackageVersionKeys input keyToPackageName keyToTag f = do
 -- |
 -- | where the value paired with each version is a full description of the error
 -- | that caused the particular package version to fail.
-toFailureObject
-  :: PackageFailures
-  -> Object (Object (Object String))
-toFailureObject m = do
-  foldlWithIndex foldFn Object.empty m
-  where
-  foldFn package exclusionMap errorMap = do
-    let new = Object.fromFoldable $ (Map.toUnfoldable :: _ -> Array _) $ reassociate package errorMap
-    Object.unionWith (Object.unionWith append) new exclusionMap
+mkExclusions :: PackageFailures -> Object (Object (Object String))
+mkExclusions _ = Object.empty
 
-  reassociate
-    :: String
-    -> Map (Maybe GitHub.Tag) ImportError
-    -> Map String (Object (Object String))
-  reassociate package semverMap = foldlWithIndex foldFn' Map.empty semverMap
-    where
-    foldFn' mbSemVer exclusionMap importError = do
-      let
-        errorKey = BowerImport.Error.printImportErrorKey importError
-        errorDetail = BowerImport.Error.printImportError importError
-        version = case mbSemVer of
-          Nothing -> "null"
-          Just tag -> tag.name
-
-      Map.insertWith (Object.unionWith append) errorKey (Object.singleton package (Object.singleton version errorDetail)) exclusionMap
--}
+mkRegistryIndex :: Map PackageName (Map SemVer Manifest) -> RegistryIndex
+mkRegistryIndex _ = Map.empty
