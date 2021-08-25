@@ -30,8 +30,11 @@ import Registry.PackageName (PackageName)
 import Registry.PackageName as PackageName
 import Registry.Schema (Repo(..), Manifest)
 import Registry.Scripts.BowerImport.Error (ImportError(..), ManifestError(..))
+import Registry.Scripts.BowerImport.Error as BowerImport.Error
 import Text.Parsing.StringParser as StringParser
 import Web.Bower.PackageMeta as Bower
+
+type ImportErrorKey = String
 
 -- | An unprocessed package name, which may possibly be malformed.
 type RawPackageName = String
@@ -39,9 +42,9 @@ type RawPackageName = String
 -- | An unprocessed version, taken from a GitHub tag
 type RawVersion = String
 
--- | A map of package names to versions that do not produce a valid manifest,
--- | along with information about why they failed.
-type PackageFailures = Map RawPackageName (Map (Maybe String) ImportError)
+-- | A map of error types to package names to package versions, where failed
+-- | versions contain rich information about why they failed.
+type PackageFailures = Map ImportErrorKey (Map RawPackageName (Map (Maybe RawVersion) ImportError))
 
 -- | This main loop uploads legacy packages to the new Registry
 -- | In order to do this, we:
@@ -55,6 +58,14 @@ main = Aff.launchAff_ do
   _registry <- downloadBowerRegistry
   log "Done!"
 
+-- TODO:
+-- 1. Write codecs for the PackageFailures type for encoding / decoding so I can
+--    parse it back.
+--
+-- 2. Write the exclusions file out to text.
+--
+-- 3. Read the exclusions file, and exclude any packages that fail because of
+--    missing or malformed Bowerfiles or GitHub repo urls.
 downloadBowerRegistry :: Aff RegistryIndex
 downloadBowerRegistry = do
   bowerPackages <- readRegistryFile "bower-packages.json"
@@ -111,16 +122,15 @@ downloadBowerRegistry = do
     Except.mapExceptT liftError $ toManifest name repo semVer bowerfile
 
   let
-    exclusions :: Object _
-    exclusions = mkExclusions manifestRegistry.failures
-
-    packageMap :: Map PackageName (Map SemVer Manifest)
-    packageMap = Map.fromFoldable $ map (lmap _.name) $ (Map.toUnfoldable manifestRegistry.packages :: Array _)
-
     registryIndex :: RegistryIndex
-    registryIndex = mkRegistryIndex packageMap
+    registryIndex = do
+      let
+        packageManifests :: Array (Tuple PackageName (Map SemVer Manifest))
+        packageManifests = map (lmap _.name) $ Map.toUnfoldable manifestRegistry.packages
 
-  writeJsonFile "bower-exclusions.json" exclusions
+      Map.fromFoldable packageManifests
+
+  writeJsonFile "bower-exclusions.json" $ toExclusions manifestRegistry.failures
   pure registryIndex
 
 -- | Find the bower.json files associated with the package's released tags,
@@ -360,8 +370,9 @@ forPackage input keyToPackageName f =
     lift (Except.runExceptT (f key value)) >>= case _ of
       Left err -> do
         let
+          errorType = BowerImport.Error.printImportErrorKey err
           name = keyToPackageName key
-          newFailure = Map.singleton Nothing err
+          newFailure = Map.singleton errorType (Map.singleton Nothing err)
           insertFailure = Map.insertWith Map.union name newFailure
         State.modify \state -> state { failures = insertFailure state.failures }
       Right (Tuple newKey result) -> do
@@ -391,9 +402,10 @@ forPackageVersion input keyToPackageName keyToTag f = do
         lift (Except.runExceptT (f k1 k2 value)) >>= case _ of
           Left err -> do
             let
+              errorType = BowerImport.Error.printImportErrorKey err
               name = keyToPackageName k1
               tag = keyToTag k2
-              newFailure = Map.singleton (Just tag) err
+              newFailure = Map.singleton errorType (Map.singleton (Just tag) err)
               insertFailure = Map.insertWith Map.union name newFailure
             State.modify \state -> state { failures = insertFailure state.failures }
           Right result -> do
@@ -422,10 +434,11 @@ forPackageVersionKeys input keyToPackageName keyToTag f = do
         lift (Except.runExceptT (f k1 k2)) >>= case _ of
           Left err -> do
             let
+              errorType = BowerImport.Error.printImportErrorKey err
               name = keyToPackageName k1
               tag = keyToTag k2
-              newFailure = Map.singleton (Just tag) err
-              insertFailure = Map.insertWith Map.union name newFailure
+              newFailure = Map.singleton name (Map.singleton (Just tag) err)
+              insertFailure = Map.insertWith Map.union errorType newFailure
             State.modify \state -> state { failures = insertFailure state.failures }
           Right (Tuple k3 k4) -> do
             let
@@ -440,8 +453,58 @@ forPackageVersionKeys input keyToPackageName keyToTag f = do
 -- |
 -- | where the value paired with each version is a full description of the error
 -- | that caused the particular package version to fail.
-mkExclusions :: PackageFailures -> Object (Object (Object String))
-mkExclusions _ = Object.empty
+toExclusions :: PackageFailures -> Object (Object (Object String))
+toExclusions = toObject <<< map toObject <<< map (map toErrorObject)
+  where
+  toObject :: forall a. Map String a -> Object a
+  toObject = Object.fromFoldable <<< toKeyValues
 
-mkRegistryIndex :: Map PackageName (Map SemVer Manifest) -> RegistryIndex
-mkRegistryIndex _ = Map.empty
+  toKeyValues :: forall k v. Map k v -> Array (Tuple k v)
+  toKeyValues = Map.toUnfoldable
+
+  toErrorObject :: Map (Maybe RawVersion) ImportError -> Object String
+  toErrorObject =
+    Object.fromFoldable
+      <<< map (bimap (fromMaybe "null") BowerImport.Error.printImportError)
+      <<< toKeyValues
+
+-- | Read an exclusions file, producing a list of package versions that should
+-- | be skipped.
+readExclusions :: Aff (Map RawPackageName (Set RawVersion))
+readExclusions = do
+  eitherContents <- readJsonFile "../bower-exclusions.json"
+  case eitherContents of
+    Left err ->
+      throwError $ Aff.error $ Json.printJsonDecodeError err
+    Right val ->
+      pure val
+
+-- TODO: Write codecs for this and `ImportError` so that it's a more structured
+-- bidirectional PackageFailures <-> Object (Object (Object String))
+fromExclusions :: Object (Object (Object String)) -> Map RawPackageName (Set RawVersion)
+fromExclusions =
+  Map.unions
+    <<< Object.values
+    <<< map fromObject
+    <<< map (map fromErrorObject)
+    <<< filterExclusions
+  where
+  fromObject :: forall a. Object a -> Map String a
+  fromObject = Map.fromFoldable <<< toKeyValues
+
+  toKeyValues :: forall a. Object a -> Array (Tuple String a)
+  toKeyValues = Object.toUnfoldable
+
+  fromErrorObject :: Object String -> Set RawVersion
+  fromErrorObject = Set.filter (_ /= "null") <<< Set.fromFoldable <<< map fst <<< toKeyValues
+
+  filterExclusions :: Object (Object (Object String)) -> Object (Object (Object String))
+  filterExclusions = do
+    let
+      print = BowerImport.Error.printImportErrorKey
+      condition key =
+        (key == print (InvalidGitHubRepo mempty))
+          || (key == print NoReleases)
+          || (key == print MissingBowerfile)
+
+    Object.filterKeys condition

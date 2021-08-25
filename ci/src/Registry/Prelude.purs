@@ -4,6 +4,7 @@ module Registry.Prelude
   , module Either
   , module Maybe
   , partitionEithers
+  , readJsonFile
   , writeJsonFile
   , stripPureScriptPrefix
   , newlines
@@ -14,7 +15,7 @@ import Prelude
 import Control.Monad.Error.Class (throwError) as Extra
 import Control.Monad.Except (ExceptT(..)) as Extra
 import Control.Monad.Trans.Class (lift) as Extra
-import Data.Argonaut (class EncodeJson, encodeJson, stringifyWithIndent)
+import Data.Argonaut as Json
 import Data.Array as Array
 import Data.Array.NonEmpty (NonEmptyArray) as Extra
 import Data.Bifunctor (bimap, lmap, rmap) as Extra
@@ -54,8 +55,16 @@ partitionEithers = Array.foldMap case _ of
   Either.Right res -> { fail: [], success: [ res ] }
 
 -- | Encode data as JSON and write it to the provided filepath
-writeJsonFile :: forall a. EncodeJson a => Extra.FilePath -> a -> Extra.Aff Unit
-writeJsonFile path = FS.writeTextFile Extra.UTF8 path <<< stringifyWithIndent 2 <<< encodeJson
+writeJsonFile :: forall a. Json.EncodeJson a => Extra.FilePath -> a -> Extra.Aff Unit
+writeJsonFile path = FS.writeTextFile Extra.UTF8 path <<< Json.stringifyWithIndent 2 <<< Json.encodeJson
+
+-- | Decode data from a JSON file at the provided filepath
+readJsonFile :: forall a. Json.DecodeJson a => Extra.FilePath -> Extra.Aff (Either.Either Json.JsonDecodeError a)
+readJsonFile path = do
+  contents <- FS.readTextFile Extra.UTF8 path
+  pure $ Json.decodeJson =<< Json.parseJson contents
+
+-- <<< stringifyWithIndent 2 <<< encodeJson
 
 -- | Strip the "purescript-" prefix from a package name, if present.
 -- |

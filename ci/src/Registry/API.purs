@@ -180,7 +180,11 @@ addOrUpdate { ref, fromBower, packageName } metadata = do
           runManifest =
             Except.runExceptT <<< Except.mapExceptT (liftAff <<< map (lmap printErrors))
 
-        runManifest (BowerImport.toManifest packageName metadata.location ref bowerfile) >>= case _ of
+        semVer <- case SemVer.parseSemVer ref of
+          Nothing -> throwWithComment $ "Not a valid SemVer version: " <> ref
+          Just result -> pure result
+
+        runManifest (BowerImport.toManifest packageName metadata.location semVer bowerfile) >>= case _ of
           Left err ->
             throwWithComment $ "Unable to convert Bowerfile to a manifest: " <> err
           Right manifest ->
